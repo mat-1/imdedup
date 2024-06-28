@@ -1,9 +1,15 @@
 use std::{
+    cmp,
     collections::BTreeMap,
     env, fs,
     io::{self, Write},
     process,
+    sync::atomic::{self, AtomicU64},
+    time::SystemTime,
 };
+
+use parking_lot::Mutex;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 fn invalid_usage() -> ! {
     eprintln!("usage: {} <path> [--delete]", env::args().next().unwrap());
@@ -36,14 +42,16 @@ fn parse_args() -> Args {
 
 struct StoredImage {
     pub path: String,
-    pub size: u64,
+    // used for choosing which file to delete
+    pub file_size: u64,
+    pub created_at: SystemTime,
 }
 
 fn main() {
     let args = parse_args();
 
     let hasher = image_hasher::HasherConfig::new().to_hasher();
-    let mut hashes: BTreeMap<Vec<u8>, StoredImage> = BTreeMap::new();
+    let hashes = Mutex::new(BTreeMap::<Vec<u8>, StoredImage>::new());
 
     let mut file_paths = Vec::new();
     for entry in fs::read_dir(args.path).unwrap() {
@@ -56,23 +64,26 @@ fn main() {
     }
     let file_count = file_paths.len();
 
-    let mut dup_count = 0;
-    let mut sim_count = 0;
-    let mut uniq_count = 0;
+    let dup_count = AtomicU64::new(0);
+    let sim_count = AtomicU64::new(0);
+    let uniq_count = AtomicU64::new(0);
 
-    for (i, path) in file_paths.into_iter().enumerate() {
+    let processed_count = AtomicU64::new(0);
+
+    file_paths.into_par_iter().for_each(|path| {
         let Ok(image) = image::open(&path) else {
-            continue;
+            return;
         };
         let hash = hasher.hash_image(&image);
         let hash = hash.as_bytes().to_vec();
 
         let path_string = path.to_string_lossy().to_string();
 
+        let mut hashes = hashes.lock();
         let dup_of = hashes.get(&hash);
         let mut sim_to = None;
 
-        for (other_hash, other_path) in &hashes {
+        for (other_hash, other_path) in hashes.iter() {
             let mut diff_bits = 0;
             for (a, b) in hash.iter().zip(other_hash.iter()) {
                 diff_bits += (a ^ b).count_ones();
@@ -98,6 +109,7 @@ fn main() {
 
         let hash_hex = hex::encode(&hash);
 
+        let i = processed_count.fetch_add(1, atomic::Ordering::Relaxed);
         print!(
             "{}/{file_count} \x1b[90m{hash_hex}\x1b[m {display}\r",
             i + 1
@@ -108,26 +120,33 @@ fn main() {
         }
 
         if dup_of.is_some() {
-            dup_count += 1;
+            dup_count.fetch_add(1, atomic::Ordering::Relaxed);
         } else if sim_to.is_some() {
-            sim_count += 1;
+            sim_count.fetch_add(1, atomic::Ordering::Relaxed);
         } else {
-            uniq_count += 1;
+            uniq_count.fetch_add(1, atomic::Ordering::Relaxed);
         }
 
-        let file_size = fs::metadata(&path).unwrap().len();
+        let metadata = fs::metadata(&path).unwrap();
+        let file_size = metadata.len();
+        let created_at = metadata.created().unwrap();
 
         let mut should_insert = true;
 
         if args.delete {
             if let Some(previous_stored_image) = previous_stored_image {
-                // delete the smaller file
-                let path_to_delete = if file_size > previous_stored_image.size {
-                    &previous_stored_image.path
-                } else {
-                    should_insert = false;
-                    &path_string
+                let path_to_delete = match file_size.cmp(&previous_stored_image.file_size) {
+                    cmp::Ordering::Equal => {
+                        if created_at > previous_stored_image.created_at {
+                            &previous_stored_image.path
+                        } else {
+                            &path_string
+                        }
+                    }
+                    cmp::Ordering::Greater => &previous_stored_image.path,
+                    cmp::Ordering::Less => &path_string,
                 };
+                should_insert = path_to_delete != &path_string;
                 fs::remove_file(path_to_delete).unwrap();
             }
         }
@@ -137,11 +156,16 @@ fn main() {
                 hash,
                 StoredImage {
                     path: path_string,
-                    size: file_size,
+                    file_size,
+                    created_at,
                 },
             );
         }
-    }
+    });
+
+    let dup_count = dup_count.load(atomic::Ordering::Relaxed);
+    let sim_count = sim_count.load(atomic::Ordering::Relaxed);
+    let uniq_count = uniq_count.load(atomic::Ordering::Relaxed);
 
     // extra spaces at the end to remove any possible leftover characters :)
     println!(
