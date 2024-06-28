@@ -1,0 +1,9 @@
+[package]
+name = "imdedup"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hex = "0.4.3"
+image = "0.25.1"
+image_hasher = "2.0.0"
