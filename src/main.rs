@@ -135,9 +135,11 @@ fn main() {
 
         if args.delete {
             if let Some(previous_stored_image) = previous_stored_image {
+                // delete the smaller image
                 let path_to_delete = match file_size.cmp(&previous_stored_image.file_size) {
                     cmp::Ordering::Equal => {
-                        if created_at > previous_stored_image.created_at {
+                        // delete the newer image
+                        if previous_stored_image.created_at > created_at {
                             &previous_stored_image.path
                         } else {
                             &path_string
